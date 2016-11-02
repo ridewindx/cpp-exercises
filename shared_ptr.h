@@ -6,6 +6,8 @@
 
 namespace rwx {
 
+using std::nullptr_t;
+
 class bad_weak_ptr : public std::exception {
 public:
     virtual const char* what() const noexcept {
@@ -15,11 +17,11 @@ public:
     virtual ~bad_weak_ptr() noexcept = default;
 };
 
-class SpCountedBase {
+class _sp_counted_base {
 public:
-    SpCountedBase() noexcept : use_count_(1), weak_count_(1) {}
+    _sp_counted_base() noexcept : use_count_(1), weak_count_(1) {}
 
-    virtual ~SpCountedBase() noexcept {}
+    virtual ~_sp_counted_base() noexcept = default;
 
     /* Called when use_count_ drops to zero, to release the resources managed by *this. */
     virtual void dispose() noexcept = 0;
@@ -29,10 +31,12 @@ public:
 
     virtual void* get_deleter(const std::type_info&) noexcept = 0;
 
-    void add_ref_copy() { ++use_count_; }
+    void add_ref_copy() {
+        use_count_.fetch_add(1, std::memory_order_acq_rel);
+    }
 
+    /* Perform lock-free add-if-equal operation. */
     void add_ref_lock() {
-        /* Perform lock-free add-if-not-zero operation. */
         auto count = get_use_count();
         /* Replace the current counter value with the old value + 1, as long as it's not changed meanwhile. */
         do {
@@ -43,8 +47,8 @@ public:
                                                       std::memory_order_relaxed));
     }
 
+    /* Perform lock-free add-if-equal operation. */
     bool add_ref_lock_nothrow() {
-        /* Perform lock-free add-if-not-zero operation. */
         auto count = get_use_count();
         /* Replace the current counter value with the old value + 1, as long as it's not changed meanwhile. */
         do {
@@ -57,7 +61,7 @@ public:
     }
 
     void release() noexcept {
-        if (use_count_.fetch_sub(1) == 1) {
+        if (use_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             dispose();
 
             if (weak_count_.fetch_sub(1) == 1)
@@ -65,10 +69,12 @@ public:
         }
     }
 
-    void weak_add_ref() noexcept { ++weak_count_; }
+    void weak_add_ref() noexcept {
+        weak_count_.fetch_add(1, std::memory_order_acq_rel);
+    }
 
     void weak_release() noexcept {
-        if (weak_count_.fetch_sub(1) == 1)
+        if (weak_count_.fetch_sub(1, std::memory_order_acq_rel) == 1)
             destroy();
     }
 
@@ -78,13 +84,13 @@ public:
     }
 
 private:
-    SpCountedBase(const SpCountedBase&) = delete;
-    SpCountedBase& operator=(const SpCountedBase&) = delete;
+    // No copy.
+    _sp_counted_base(const _sp_counted_base&) = delete;
+    _sp_counted_base& operator=(const _sp_counted_base&) = delete;
 
     std::atomic_long use_count_;
     std::atomic_long weak_count_;
 };
-
 
 // Forward declarations.
 template <typename T>
@@ -100,11 +106,10 @@ class weak_count;
 
 class shared_count;
 
-
 template <typename Ptr>
-class SpCountedPtr final : public SpCountedBase {
+class _sp_counted_ptr final : public _sp_counted_base {
 public:
-    explicit SpCountedPtr(Ptr p) noexcept : ptr_(p) {}
+    explicit _sp_counted_ptr(Ptr p) noexcept : ptr_(p) {}
 
     virtual void dispose() noexcept { delete ptr_; }
 
@@ -112,34 +117,35 @@ public:
 
     virtual void* get_deleter(const std::type_info&) noexcept { return nullptr; }
 
-    SpCountedPtr(const SpCountedPtr&) = delete;
-    SpCountedPtr& operator=(const SpCountedPtr&) = delete;
+    // No copy
+    _sp_counted_ptr(const _sp_counted_ptr&) = delete;
+    _sp_counted_ptr& operator=(const _sp_counted_ptr&) = delete;
 
 private:
     Ptr ptr_;
 };
 
+// Specialization for null pointer.
 template <>
-inline void SpCountedPtr<std::nullptr_t>::dispose() noexcept {}
-
+inline void _sp_counted_ptr<std::nullptr_t>::dispose() noexcept {}
 
 template <int Nm, typename T, bool use_ebo = not std::is_final<T>::value and std::is_empty<T>::value>
-struct SpEboHelper;
+struct _sp_ebo_helper;
 
-/// Specialization using EBO.
+// Specialization using EBO.
 template <int Nm, typename T>
-struct SpEboHelper<Nm, T, true> : private T {
-    explicit SpEboHelper(const T& t) : T(t) {}
+struct _sp_ebo_helper<Nm, T, true> : private T {
+    explicit _sp_ebo_helper(const T& t) : T(t) {}
 
-    static T& get(SpEboHelper& eboh) { return static_cast<T&>(eboh); }
+    static T& get(_sp_ebo_helper& eboh) { return static_cast<T&>(eboh); }
 };
 
-/// Specialization not using EBO.
+// Specialization not using EBO.
 template <int Nm, typename T>
-struct SpEboHelper<Nm, T, false> {
-    explicit SpEboHelper(const T& t) : t_(t) {}
+struct _sp_ebo_helper<Nm, T, false> {
+    explicit _sp_ebo_helper(const T& t) : t_(t) {}
 
-    static T& get(SpEboHelper& eboh) { return eboh.t_; }
+    static T& get(_sp_ebo_helper& eboh) { return eboh.t_; }
 
 private:
     T t_;
@@ -147,10 +153,10 @@ private:
 
 // Support for custom deleter and/or allocator
 template <typename Ptr, typename Deleter, typename Alloc>
-class SpCountedDeleter final : public SpCountedBase {
-    class Impl : SpEboHelper<0, Deleter>, SpEboHelper<1, Alloc> {
-        using DeleterBase = SpEboHelper<0, Deleter>;
-        using AllocBase = SpEboHelper<1, Alloc>;
+class _sp_counted_deleter final : public _sp_counted_base {
+    class Impl : _sp_ebo_helper<0, Deleter>, _sp_ebo_helper<1, Alloc> {
+        using DeleterBase = _sp_ebo_helper<0, Deleter>;
+        using AllocBase = _sp_ebo_helper<1, Alloc>;
 
     public:
         Impl(Ptr p, Deleter d, const Alloc& a) noexcept
@@ -165,23 +171,21 @@ class SpCountedDeleter final : public SpCountedBase {
 
 public:
     // d(p) must not throw
-    SpCountedDeleter(Ptr p, Deleter d) noexcept
+    _sp_counted_deleter(Ptr p, Deleter d) noexcept
         : impl_(p, d, Alloc())
     {}
 
     // d(p) must not throw
-    SpCountedDeleter(Ptr p, Deleter d, const Alloc& a) noexcept
+    _sp_counted_deleter(Ptr p, Deleter d, const Alloc& a) noexcept
         : impl_(p, d, a)
     {}
-
-    ~SpCountedDeleter() noexcept {}
 
     virtual void dispose() noexcept {
         impl_.deleter()(impl_.ptr_);
     }
 
     virtual void destroy() noexcept {
-        using AllocTraits = typename std::allocator_traits<Alloc>::template rebind_traits<SpCountedDeleter>;
+        using AllocTraits = typename std::allocator_traits<Alloc>::template rebind_traits<_sp_counted_deleter>;
 
         typename AllocTraits::allocator_type a(impl_.alloc());
         AllocTraits::destroy(a, this);
@@ -190,7 +194,7 @@ public:
 
     virtual void* get_deleter(const std::type_info& ti) noexcept {
         return ti == typeid(Deleter)
-               ? std::addressof(impl_.del_())
+               ? std::addressof(impl_.deleter())
                : nullptr;
     }
 
@@ -224,9 +228,9 @@ struct _aligned_buffer
 struct _sp_make_shared_tag {};
 
 template <typename T, typename Alloc>
-class _sp_counted_ptr_inplace final : public SpCountedBase {
-    class Impl : SpEboHelper<0, Alloc> {
-        using AllocBase = SpEboHelper<0, Alloc>;
+class _sp_counted_ptr_inplace final : public _sp_counted_base {
+    class Impl : _sp_ebo_helper<0, Alloc> {
+        using AllocBase = _sp_ebo_helper<0, Alloc>;
 
     public:
         explicit Impl(Alloc a) noexcept : AllocBase(a) {}
@@ -254,11 +258,11 @@ public:
     virtual void destroy() noexcept {
         using AllocTraits = typename std::allocator_traits<Alloc>::template rebind_traits<_sp_counted_ptr_inplace>;
         typename AllocTraits::allocator_type a(impl_.alloc());
-        AllocTraits::destory(a, this);
+        AllocTraits::destroy(a, this);
         AllocTraits::deallocate(a, this, 1);
     }
 
-    // Sneaky trick so __shared_ptr can get the managed pointer
+    // Sneaky trick so shared_ptr can get the managed pointer
     virtual void* get_deleter(const std::type_info& ti) noexcept {
         if (ti == typeid(_sp_make_shared_tag))
             return const_cast<typename std::remove_cv<T>::type*>(ptr());
@@ -270,7 +274,6 @@ private:
     Impl impl_;
 };
 
-
 class shared_count {
 public:
     constexpr shared_count() noexcept : pi_(0) {};
@@ -278,7 +281,7 @@ public:
     template <typename Ptr>
     explicit shared_count(Ptr p) : pi_(0) {
         try {
-            pi_ = new SpCountedPtr<Ptr>(p);
+            pi_ = new _sp_counted_ptr<Ptr>(p);
         } catch (...) {
             delete p;
             throw;
@@ -290,7 +293,7 @@ public:
 
     template <typename Ptr, typename Deleter, typename Alloc>
     shared_count(Ptr p, Deleter d, Alloc a) : pi_(0) {
-        using SpCD = SpCountedDeleter<Ptr, Deleter, Alloc>;
+        using SpCD = _sp_counted_deleter<Ptr, Deleter, Alloc>;
         using AllocTraits = typename std::allocator_traits<Alloc>::template rebind_traits<SpCD>;
 
         typename AllocTraits::allocator_type a2(a);
@@ -334,7 +337,7 @@ public:
         using Deleter2 = typename std::conditional<std::is_reference<Deleter>::value,
                                                     std::reference_wrapper<typename std::remove_reference<Deleter>::type>,
                                                     Deleter>::type;
-        using _sp_cd_type = SpCountedDeleter<Ptr, Deleter2, std::allocator<void>>;
+        using _sp_cd_type = _sp_counted_deleter<Ptr, Deleter2, std::allocator<void>>;
         using Alloc = std::allocator<_sp_cd_type>;
         using AllocTraits = std::allocator_traits<Alloc>;
         Alloc a;
@@ -361,7 +364,7 @@ public:
     }
 
     shared_count& operator=(const shared_count& r) noexcept {
-        SpCountedBase* tmp = r.pi_;
+        _sp_counted_base* tmp = r.pi_;
         if (tmp != pi_) {
             if (tmp)
                 tmp->add_ref_copy();
@@ -373,7 +376,7 @@ public:
     }
 
     void swap(shared_count& r) noexcept {
-        SpCountedBase* tmp = r.pi_;
+        _sp_counted_base* tmp = r.pi_;
         r.pi_ = pi_;
         pi_ = tmp;
     }
@@ -391,7 +394,7 @@ public:
     }
 
     bool less(const shared_count& r) const noexcept {
-        return std::less<SpCountedBase*>()(pi_, r.pi_);
+        return std::less<_sp_counted_base*>()(pi_, r.pi_);
     }
 
     bool less(const weak_count& r) const noexcept;
@@ -403,10 +406,8 @@ public:
 private:
     friend class weak_count;
 
-private:
-    SpCountedBase* pi_;
+    _sp_counted_base* pi_;
 };
-
 
 class weak_count {
 public:
@@ -432,7 +433,7 @@ public:
     }
 
     weak_count& operator=(const shared_count& r) noexcept {
-        SpCountedBase* tmp = r.pi_;
+        _sp_counted_base* tmp = r.pi_;
         if (tmp)
             tmp->weak_add_ref();
         if (pi_)
@@ -442,7 +443,7 @@ public:
     }
 
     weak_count& operator=(const weak_count& r) noexcept {
-        SpCountedBase* tmp = r.pi_;
+        _sp_counted_base* tmp = r.pi_;
         if (tmp)
             tmp->weak_add_ref();
         if (pi_)
@@ -460,7 +461,7 @@ public:
     }
 
     void swap(weak_count& r) noexcept {
-        SpCountedBase* tmp = r.pi_;
+        _sp_counted_base* tmp = r.pi_;
         r.pi_ = pi_;
         pi_ = tmp;
     }
@@ -470,14 +471,13 @@ public:
     }
 
     bool less(const weak_count& r) const noexcept {
-        return std::less<SpCountedBase*>()(pi_, r.pi_);
+        return std::less<_sp_counted_base*>()(pi_, r.pi_);
     }
 
     bool less(const shared_count& r) const noexcept {
-        return std::less<SpCountedBase*>()(pi_, r.pi_);
+        return std::less<_sp_counted_base*>()(pi_, r.pi_);
     }
 
-    // Friend functioin injected into enclosing namespace and founc by ADL
     friend inline bool operator==(const weak_count& a, const weak_count& b) noexcept {
         return a.pi_ == b.pi_;
     }
@@ -485,7 +485,7 @@ public:
 private:
     friend class shared_count;
 
-    SpCountedBase* pi_;
+    _sp_counted_base* pi_;
 };
 
 // Now that weak_count is defined we can define this constructor:
@@ -507,18 +507,19 @@ inline shared_count::shared_count(const weak_count& r, std::nothrow_t)
 }
 
 inline bool shared_count::less(const weak_count& r) const noexcept {
-    return std::less<SpCountedBase*>()(pi_, r.pi_);
+    return std::less<_sp_counted_base*>()(pi_, r.pi_);
 }
-
 
 // Support for enable_shared_from_this.
 
 // Friend of enable_shared_from_this.
+// Match object type that inherit from enable_shared_from_this.
 template <typename T1, typename T2>
 void enable_shared_from_this_helper(const shared_count&,
                                     const enable_shared_from_this<T1>*,
                                     const T2*) noexcept;
 
+// Match any other type that doesn't inherit from enable_shared_from_this.
 inline void enable_shared_from_this_helper(const shared_count&, ...) noexcept {}
 
 /**
@@ -539,18 +540,22 @@ public:
      *  @brief  Construct an empty %shared_ptr.
      *  @post   use_count()==0 && get()==0
      */
-    constexpr shared_ptr() noexcept : ptr_(0), refcount_() {}
+    constexpr shared_ptr() noexcept : ptr_(nullptr), refcount_() {}
 
     shared_ptr(const shared_ptr&) noexcept = default;
+
+    ~shared_ptr() = default;
 
     /**
      *  @brief  Construct a %shared_ptr that owns the pointer @a p.
      *  @param  p  A pointer that is convertible to element_type*.
-     *  @post   use_count() == 1 && get() == __p
+     *  @post   use_count() == 1 && get() == p
      *  @throw  std::bad_alloc, in which case @c delete @a p is called.
      */
     template <typename T1>
-    explicit shared_ptr(T1* p) : ptr_(p), refcount_(p) {
+    explicit shared_ptr(T1* p)
+        : ptr_(p), refcount_(p)
+    {
         static_assert(not std::is_void<T1>::value, "incomplete type");
         static_assert(sizeof(T1) > 0, "incomplete type");
         enable_shared_from_this_helper(refcount_, p, p);
@@ -570,7 +575,9 @@ public:
      *  shared_ptr will release p by calling d(p)
      */
     template <typename T1, typename Deleter>
-    shared_ptr(T1* p, Deleter d) : ptr_(p), refcount_(p, d) {
+    shared_ptr(T1* p, Deleter d)
+        : ptr_(p), refcount_(p, std::move(d))
+    {
         enable_shared_from_this_helper(refcount_, p, p);
     }
 
@@ -584,13 +591,15 @@ public:
      *  @throw  std::bad_alloc, in which case @a d(p) is called.
      *
      *  Requirements: Deleter's copy constructor and destructor must
-     *  not throw Alloc's copy constructor and destructor must not
+     *  not throw, Alloc's copy constructor and destructor must not
      *  throw.
      *
      *  shared_ptr will release p by calling d(p)
      */
     template <typename T1, typename Deleter, typename Alloc>
-    shared_ptr(T1* p, Deleter d, Alloc a) : ptr_(p), refcount_(p, d, std::move(a)) {
+    shared_ptr(T1* p, Deleter d, Alloc a)
+        : ptr_(p), refcount_(p, std::move(d), std::move(a))
+    {
         enable_shared_from_this_helper(refcount_, p, p);
     }
 
@@ -608,7 +617,9 @@ public:
      *  The last owner will call d(p)
      */
     template <typename Deleter>
-    shared_ptr(nullptr_t p, Deleter d) : ptr_(0), refcount_(p, d) {}
+    shared_ptr(nullptr_t p, Deleter d)
+        : ptr_(0), refcount_(p, std::move(d))
+    {}
 
     /**
      *  @brief  Construct a %shared_ptr that owns a null pointer
@@ -626,7 +637,9 @@ public:
      *  The last owner will call d(p)
      */
     template <typename Deleter, typename Alloc>
-    shared_ptr(nullptr_t p, Deleter d, Alloc a) : ptr_(0), refcount_(p, d, std::move(a)) {}
+    shared_ptr(nullptr_t p, Deleter d, Alloc a)
+        : ptr_(0), refcount_(p, std::move(d), std::move(a))
+    {}
 
     // Aliasing constructor
 
@@ -647,9 +660,9 @@ public:
      * @endcode
      */
     template <typename T1>
-    shared_ptr(const shared_ptr<T1>& r, T* p) noexcept : ptr_(p), refcount_(r.refcount_) {}
-
-    ~shared_ptr() = default;
+    shared_ptr(const shared_ptr<T1>& r, T* p) noexcept
+        : ptr_(p), refcount_(r.refcount_)
+    {}
 
     /**
      *  @brief  If @a r is empty, constructs an empty %shared_ptr;
@@ -659,14 +672,18 @@ public:
      *  @post   get() == r.get() && use_count() == r.use_count()
      */
     template <typename T1, typename = Convertible<T1*>>
-    shared_ptr(const shared_ptr<T1>& r) noexcept : ptr_(r.ptr_), refcount_(r.refcount_) {}
+    shared_ptr(const shared_ptr<T1>& r) noexcept
+        : ptr_(r.ptr_), refcount_(r.refcount_)
+    {}
 
     /**
      *  @brief  Move-constructs a %shared_ptr instance from @a r.
      *  @param  r  A %shared_ptr rvalue.
      *  @post   *this contains the old value of @a r, @a r is empty.
      */
-    shared_ptr(shared_ptr&& r) noexcept : ptr_(r.ptr_), refcount_() {
+    shared_ptr(shared_ptr&& r) noexcept
+        : ptr_(r.ptr_), refcount_()
+    {
         refcount_.swap(r.refcount_);
         r.ptr_ = 0;
     }
@@ -677,7 +694,9 @@ public:
      *  @post   *this contains the old value of @a r, @a r is empty.
      */
     template <typename T1, typename = Convertible<T1*>>
-    shared_ptr(shared_ptr<T1>&& r) noexcept : ptr_(r.ptr_), refcount_() {
+    shared_ptr(shared_ptr<T1>&& r) noexcept
+        : ptr_(r.ptr_), refcount_()
+    {
         refcount_.swap(r.refcount_);
         r.ptr_ = 0;
     }
@@ -811,7 +830,7 @@ protected:
         : ptr_(), refcount_(tag, (T*)0, a, std::forward<Args>(args)...)
     {
         // ptr_ needs to point to the newly constructed object.
-        // This relies on SpCountedPtrInplace::get_deleter;
+        // This relies on _sp_counted_ptrInplace::get_deleter;
         void* p = refcount_.get_deleter(typeid(tag));
         ptr_ = static_cast<T*>(p);
         enable_shared_from_this_helper(refcount_, ptr_, ptr_);
@@ -820,8 +839,7 @@ protected:
     template <typename T1, typename Alloc, typename... Args>
     friend shared_ptr<T1> allocate_shared(const Alloc& a, Args&&... args);
 
-    // This constructor is used by weak_ptr::lock() and
-    // shared_ptr::shared_ptr(const weak_ptr&, std::nothrow_t).
+    // This constructor is used by weak_ptr::lock().
     shared_ptr(const weak_ptr<T>& r, std::nothrow_t)
         : refcount_(r.refcount_, std::nothrow) {
         ptr_ = refcount_.get_use_count() ? r.ptr_ : nullptr;
@@ -942,13 +960,6 @@ inline bool operator>=(const shared_ptr<T>& a, nullptr_t) noexcept {
 template <typename T>
 inline bool operator>=(nullptr_t, const shared_ptr<T>& a) noexcept {
     return !(nullptr < a);
-}
-
-
-// shared_ptr specialized algorithms.
-template <typename T>
-inline void swap(shared_ptr<T>& a, shared_ptr<T>& b) noexcept {
-    a.swap(b);
 }
 
 // shared_ptr casts
@@ -1112,11 +1123,6 @@ private:
     weak_count refcount_;  // Reference counter
 };
 
-// weak_ptr specialized algorithms.
-template <typename T>
-inline void swap(weak_ptr<T>& a, weak_ptr<T>& b) noexcept {
-    a.swap(b);
-}
 template <typename T, typename T1>
 struct _sp_owner_less : public std::binary_function<T, T, bool> {
     bool operator()(const T& lhs, const T& rhs) const {
@@ -1164,12 +1170,20 @@ protected:
 
 public:
     shared_ptr<T> shared_from_this() {
-        return shared_ptr<T>(this->weak_this_);
+        return shared_ptr<T>(weak_this_);
     }
 
     shared_ptr<const T>
     shared_from_this() const {
-        return shared_ptr<const T>(this->weak_this_);
+        return shared_ptr<const T>(weak_this_);
+    }
+
+    weak_ptr<T> weak_from_this() {
+        return weak_this_;
+    }
+
+    weak_ptr<T const> weak_from_this() const {
+        return weak_this_;
     }
 
 private:
@@ -1180,8 +1194,8 @@ private:
 
     template <typename T1>
     friend void enable_shared_from_this_helper(const shared_count& pn,
-                                                const enable_shared_from_this* pe,
-                                                const T1* px) noexcept {
+                                               const enable_shared_from_this* pe,
+                                               const T1* px) noexcept {
         if (pe)
             pe->weak_assign(const_cast<T1*>(px), pn);
     }
@@ -1214,8 +1228,8 @@ inline shared_ptr<T> allocate_shared(const Alloc& a, Args&&... args) {
  */
 template <typename T, typename... Args>
 inline shared_ptr<T> make_shared(Args&&... args) {
-    return allocate_shared<T>(std::allocator<typename std::remove_const<T>::type>(),
-                              std::forward<Args>(args)...);
+    return rwx::allocate_shared<T>(std::allocator<typename std::remove_const<T>::type>(),
+                                   std::forward<Args>(args)...);
 };
 
 // shared_ptr I/O
@@ -1234,7 +1248,6 @@ inline Deleter* get_deleter(const shared_ptr<T>& p) noexcept {
 
 }
 
-
 namespace std {
 
 template <typename T>
@@ -1246,6 +1259,12 @@ struct less<rwx::shared_ptr<T>>
     }
 };
 
+// std::swap specialization for shared_ptr.
+template <typename T>
+inline void swap(rwx::shared_ptr<T>& a, rwx::shared_ptr<T>& b) noexcept {
+    a.swap(b);
+}
+
 // std::hash specialization for shared_ptr.
 template <typename T>
 struct hash<rwx::shared_ptr<T>> {
@@ -1256,5 +1275,11 @@ struct hash<rwx::shared_ptr<T>> {
         return std::hash<T*>()(s.get());
     }
 };
+
+// std::swap specialization for weak_ptr.
+template <typename T>
+inline void swap(rwx::weak_ptr<T>& a, rwx::weak_ptr<T>& b) noexcept {
+    a.swap(b);
+}
 
 }
